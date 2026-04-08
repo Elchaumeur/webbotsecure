@@ -88,4 +88,4 @@ discord-bot-panel/
 ## 🧩 Commandes Discord supportées
 
 Les bots créés via le panel répondent aux commandes personnalisées créées dans l'interface.
-Exemple : préfixe `!` + commande `aide` → le bot répond avec la réponse configurée.
+Exemple : préfixe `!` + commande `aide` → le bot répond avec la réponse configurée. this projet was made by Elchaumeur & g7333.
