@@ -1,0 +1,321 @@
+/**
+ * Discord Bot Control Panel - Server
+ * Stack: Express.js + Discord.js + sqlite3 + bcryptjs
+ */
+
+const express = require('express');
+const session = require('express-session');
+const bcrypt = require('bcryptjs');
+const path = require('path');
+const https = require('https');
+const sqlite3 = require('sqlite3').verbose();
+const { Client, GatewayIntentBits, Events } = require('discord.js');
+
+const DISCORD_CLIENT_ID     = process.env.DISCORD_CLIENT_ID     || 'MET_TON_CLIENT_ID';
+const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || 'METS_TON_CLIENT_SECRET_ICI';
+const BASE_URL              = process.env.BASE_URL               || 'http://localhost:3000';
+const DISCORD_REDIRECT_URI  = `${BASE_URL}/auth/discord/callback`;
+const DISCORD_SCOPES        = 'identify email';
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+const db = new sqlite3.Database('./botpanel.db');
+
+function dbRun(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function(err) {
+      if (err) reject(err); else resolve(this);
+    });
+  });
+}
+function dbGet(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => { if (err) reject(err); else resolve(row); });
+  });
+}
+function dbAll(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => { if (err) reject(err); else resolve(rows); });
+  });
+}
+
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    email TEXT,
+    password TEXT,
+    discord_id TEXT UNIQUE,
+    discord_avatar TEXT,
+    discord_tag TEXT,
+    auth_type TEXT DEFAULT 'local',
+    role TEXT DEFAULT 'user',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS bots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    token TEXT NOT NULL,
+    client_id TEXT,
+    prefix TEXT DEFAULT '!',
+    status TEXT DEFAULT 'offline',
+    description TEXT,
+    auto_restart INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_started DATETIME,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS bot_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bot_id INTEGER NOT NULL,
+    level TEXT DEFAULT 'info',
+    message TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(bot_id) REFERENCES bots(id)
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS bot_commands (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bot_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    response TEXT NOT NULL,
+    enabled INTEGER DEFAULT 1,
+    usage_count INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(bot_id) REFERENCES bots(id)
+  )`);
+});
+
+const botInstances = new Map();
+
+async function addLog(botId, level, message) {
+  try { await dbRun(`INSERT INTO bot_logs (bot_id, level, message) VALUES (?, ?, ?)`, [botId, level, message]); } catch(e) {}
+}
+
+async function startBot(botId) {
+  const bot = await dbGet(`SELECT * FROM bots WHERE id = ?`, [botId]);
+  if (!bot) return { success: false, error: 'Bot introuvable' };
+  if (botInstances.has(botId)) return { success: false, error: 'Bot déjà en cours d\'exécution' };
+
+  const client = new Client({
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers],
+  });
+
+  client.once(Events.ClientReady, async (c) => {
+    await dbRun(`UPDATE bots SET status='online', last_started=CURRENT_TIMESTAMP WHERE id=?`, [botId]);
+    await addLog(botId, 'success', `✅ Bot connecté en tant que ${c.user.tag}`);
+  });
+
+  client.on(Events.MessageCreate, async (message) => {
+    if (message.author.bot) return;
+    if (!message.content.startsWith(bot.prefix)) return;
+    const args = message.content.slice(bot.prefix.length).trim().split(/ +/);
+    const commandName = args.shift().toLowerCase();
+    const cmd = await dbGet(`SELECT * FROM bot_commands WHERE bot_id=? AND name=? AND enabled=1`, [botId, commandName]);
+    if (cmd) {
+      await dbRun(`UPDATE bot_commands SET usage_count = usage_count + 1 WHERE id=?`, [cmd.id]);
+      message.reply(cmd.response);
+      await addLog(botId, 'info', `📩 Commande "${commandName}" utilisée par ${message.author.tag}`);
+    }
+  });
+
+  client.on('error', async (err) => { await addLog(botId, 'error', `❌ Erreur: ${err.message}`); });
+
+  try {
+    await client.login(bot.token);
+    botInstances.set(botId, { client, startTime: Date.now() });
+    return { success: true };
+  } catch (err) {
+    await addLog(botId, 'error', `❌ Échec connexion: ${err.message}`);
+    await dbRun(`UPDATE bots SET status='error' WHERE id=?`, [botId]);
+    return { success: false, error: err.message };
+  }
+}
+
+async function stopBot(botId) {
+  const instance = botInstances.get(botId);
+  if (!instance) return { success: false, error: 'Bot non démarré' };
+  try {
+    instance.client.destroy();
+    botInstances.delete(botId);
+    await dbRun(`UPDATE bots SET status='offline' WHERE id=?`, [botId]);
+    await addLog(botId, 'info', '🛑 Bot arrêté manuellement');
+    return { success: true };
+  } catch (err) { return { success: false, error: err.message }; }
+}
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(session({
+  secret: 'discord-panel-secret-key',
+  resave: false,
+  saveUninitialized: false,
+  cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 }
+}));
+
+function requireAuth(req, res, next) {
+  if (!req.session.userId) return res.status(401).json({ error: 'Non authentifié' });
+  next();
+}
+async function requireBotOwner(req, res, next) {
+  const botId = parseInt(req.params.botId || req.body.botId);
+  const bot = await dbGet(`SELECT * FROM bots WHERE id=? AND user_id=?`, [botId, req.session.userId]);
+  if (!bot) return res.status(403).json({ error: 'Accès refusé' });
+  req.bot = bot; next();
+}
+
+function discordRequest(options, postData) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch(e) { resolve(data); } });
+    });
+    req.on('error', reject);
+    if (postData) req.write(postData);
+    req.end();
+  });
+}
+
+app.get('/auth/discord', (req, res) => {
+  const params = new URLSearchParams({ client_id: DISCORD_CLIENT_ID, redirect_uri: DISCORD_REDIRECT_URI, response_type: 'code', scope: DISCORD_SCOPES });
+  res.redirect(`https://discord.com/oauth2/authorize?${params}`);
+});
+
+app.get('/auth/discord/callback', async (req, res) => {
+  const { code, error } = req.query;
+  if (error || !code) return res.redirect('/?discord_error=access_denied');
+  try {
+    const tokenBody = new URLSearchParams({ client_id: DISCORD_CLIENT_ID, client_secret: DISCORD_CLIENT_SECRET, grant_type: 'authorization_code', code, redirect_uri: DISCORD_REDIRECT_URI }).toString();
+    const tokenData = await discordRequest({ hostname: 'discord.com', path: '/api/oauth2/token', method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(tokenBody) } }, tokenBody);
+    if (!tokenData.access_token) return res.redirect('/?discord_error=token_failed');
+    const discordUser = await discordRequest({ hostname: 'discord.com', path: '/api/users/@me', method: 'GET', headers: { Authorization: `Bearer ${tokenData.access_token}` } });
+    if (!discordUser.id) return res.redirect('/?discord_error=user_failed');
+    const avatarUrl = discordUser.avatar ? `https://cdn.discordapp.com/avatars/${discordUser.id}/${discordUser.avatar}.png` : null;
+    const tag = discordUser.discriminator && discordUser.discriminator !== '0' ? `${discordUser.username}#${discordUser.discriminator}` : discordUser.username;
+    let user = await dbGet(`SELECT * FROM users WHERE discord_id = ?`, [discordUser.id]);
+    if (!user) {
+      let baseUsername = discordUser.username.replace(/[^a-z0-9_]/gi, '') || `user_${discordUser.id}`;
+      let username = baseUsername; let suffix = 1;
+      while (await dbGet(`SELECT id FROM users WHERE username=?`, [username])) { username = `${baseUsername}${suffix++}`; }
+      const result = await dbRun(`INSERT INTO users (username, email, discord_id, discord_avatar, discord_tag, auth_type) VALUES (?, ?, ?, ?, ?, 'discord')`, [username, discordUser.email || null, discordUser.id, avatarUrl, tag]);
+      user = await dbGet(`SELECT * FROM users WHERE id=?`, [result.lastID]);
+    } else {
+      await dbRun(`UPDATE users SET discord_avatar=?, discord_tag=? WHERE id=?`, [avatarUrl, tag, user.id]);
+      user = await dbGet(`SELECT * FROM users WHERE id=?`, [user.id]);
+    }
+    req.session.userId = user.id; req.session.username = user.username;
+    res.redirect('/');
+  } catch (err) { console.error('OAuth error:', err); res.redirect('/?discord_error=server_error'); }
+});
+
+app.post('/api/auth/register', async (req, res) => {
+  const { username, email, password } = req.body;
+  if (!username || !email || !password) return res.status(400).json({ error: 'Tous les champs sont requis' });
+  if (password.length < 8) return res.status(400).json({ error: 'Mot de passe trop court (min 8 caractères)' });
+  try {
+    const hash = await bcrypt.hash(password, 12);
+    const result = await dbRun(`INSERT INTO users (username, email, password, auth_type) VALUES (?, ?, ?, 'local')`, [username, email, hash]);
+    req.session.userId = result.lastID; req.session.username = username;
+    res.json({ success: true, user: { id: result.lastID, username, email } });
+  } catch (err) {
+    if (err.message.includes('UNIQUE')) return res.status(409).json({ error: 'Nom d\'utilisateur ou email déjà utilisé' });
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { username, password } = req.body;
+  const user = await dbGet(`SELECT * FROM users WHERE username=? OR email=?`, [username, username]);
+  if (!user) return res.status(401).json({ error: 'Identifiants invalides' });
+  if (!user.password) return res.status(401).json({ error: 'Ce compte utilise la connexion Discord' });
+  const valid = await bcrypt.compare(password, user.password);
+  if (!valid) return res.status(401).json({ error: 'Identifiants invalides' });
+  req.session.userId = user.id; req.session.username = user.username;
+  res.json({ success: true, user: { id: user.id, username: user.username, email: user.email } });
+});
+
+app.post('/api/auth/logout', (req, res) => { req.session.destroy(); res.json({ success: true }); });
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+  const user = await dbGet(`SELECT id, username, email, role, auth_type, discord_id, discord_avatar, discord_tag, created_at FROM users WHERE id=?`, [req.session.userId]);
+  res.json(user);
+});
+
+app.get('/api/bots', requireAuth, async (req, res) => {
+  const bots = await dbAll(`SELECT id, name, client_id, prefix, status, description, auto_restart, created_at, last_started FROM bots WHERE user_id=?`, [req.session.userId]);
+  res.json(bots);
+});
+app.post('/api/bots', requireAuth, async (req, res) => {
+  const { name, token, client_id, prefix, description } = req.body;
+  if (!name || !token) return res.status(400).json({ error: 'Nom et token requis' });
+  try {
+    const result = await dbRun(`INSERT INTO bots (user_id, name, token, client_id, prefix, description) VALUES (?,?,?,?,?,?)`, [req.session.userId, name, token, client_id || '', prefix || '!', description || '']);
+    await addLog(result.lastID, 'info', '🤖 Bot créé');
+    res.json({ success: true, id: result.lastID });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.delete('/api/bots/:botId', requireAuth, requireBotOwner, async (req, res) => {
+  const botId = parseInt(req.params.botId);
+  if (botInstances.has(botId)) await stopBot(botId);
+  await dbRun(`DELETE FROM bot_logs WHERE bot_id=?`, [botId]);
+  await dbRun(`DELETE FROM bot_commands WHERE bot_id=?`, [botId]);
+  await dbRun(`DELETE FROM bots WHERE id=?`, [botId]);
+  res.json({ success: true });
+});
+app.put('/api/bots/:botId', requireAuth, requireBotOwner, async (req, res) => {
+  const { name, prefix, description, auto_restart } = req.body;
+  await dbRun(`UPDATE bots SET name=?, prefix=?, description=?, auto_restart=? WHERE id=?`, [name, prefix || '!', description || '', auto_restart ? 1 : 0, req.params.botId]);
+  res.json({ success: true });
+});
+app.post('/api/bots/:botId/start', requireAuth, requireBotOwner, async (req, res) => { res.json(await startBot(parseInt(req.params.botId))); });
+app.post('/api/bots/:botId/stop', requireAuth, requireBotOwner, async (req, res) => { res.json(await stopBot(parseInt(req.params.botId))); });
+app.post('/api/bots/:botId/restart', requireAuth, requireBotOwner, async (req, res) => {
+  const botId = parseInt(req.params.botId);
+  await stopBot(botId);
+  setTimeout(async () => { res.json(await startBot(botId)); }, 1500);
+});
+app.get('/api/bots/:botId/logs', requireAuth, requireBotOwner, async (req, res) => {
+  const limit = parseInt(req.query.limit) || 50;
+  const logs = await dbAll(`SELECT * FROM bot_logs WHERE bot_id=? ORDER BY created_at DESC LIMIT ?`, [req.params.botId, limit]);
+  res.json(logs.reverse());
+});
+app.delete('/api/bots/:botId/logs', requireAuth, requireBotOwner, async (req, res) => {
+  await dbRun(`DELETE FROM bot_logs WHERE bot_id=?`, [req.params.botId]); res.json({ success: true });
+});
+app.get('/api/bots/:botId/commands', requireAuth, requireBotOwner, async (req, res) => {
+  res.json(await dbAll(`SELECT * FROM bot_commands WHERE bot_id=? ORDER BY name`, [req.params.botId]));
+});
+app.post('/api/bots/:botId/commands', requireAuth, requireBotOwner, async (req, res) => {
+  const { name, response } = req.body;
+  if (!name || !response) return res.status(400).json({ error: 'Nom et réponse requis' });
+  const cleanName = name.toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  try {
+    const result = await dbRun(`INSERT INTO bot_commands (bot_id, name, response) VALUES (?,?,?)`, [req.params.botId, cleanName, response]);
+    res.json({ success: true, id: result.lastID });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.put('/api/bots/:botId/commands/:cmdId', requireAuth, requireBotOwner, async (req, res) => {
+  const { name, response, enabled } = req.body;
+  await dbRun(`UPDATE bot_commands SET name=?, response=?, enabled=? WHERE id=? AND bot_id=?`, [name, response, enabled ? 1 : 0, req.params.cmdId, req.params.botId]);
+  res.json({ success: true });
+});
+app.delete('/api/bots/:botId/commands/:cmdId', requireAuth, requireBotOwner, async (req, res) => {
+  await dbRun(`DELETE FROM bot_commands WHERE id=? AND bot_id=?`, [req.params.cmdId, req.params.botId]);
+  res.json({ success: true });
+});
+app.get('/api/bots/:botId/stats', requireAuth, requireBotOwner, async (req, res) => {
+  const botId = req.params.botId;
+  const instance = botInstances.get(parseInt(botId));
+  const cmdCount = await dbGet(`SELECT COUNT(*) as c FROM bot_commands WHERE bot_id=?`, [botId]);
+  const logCount = await dbGet(`SELECT COUNT(*) as c FROM bot_logs WHERE bot_id=?`, [botId]);
+  const totalUsage = await dbGet(`SELECT SUM(usage_count) as c FROM bot_commands WHERE bot_id=?`, [botId]);
+  res.json({ commands: cmdCount.c, logs: logCount.c, totalUsage: totalUsage.c || 0, guilds: instance ? instance.client.guilds.cache.size : 0, uptime: instance ? Math.floor((Date.now() - instance.startTime) / 1000) : 0, online: !!instance });
+});
+
+app.listen(PORT, () => {
+  console.log(`\n🚀 Discord Bot Panel démarré sur http://localhost:${PORT}`);
+  console.log(`📦 Base de données: botpanel.db`);
+  console.log(`🔑 Créez votre compte sur http://localhost:${PORT}\n`);
+});
